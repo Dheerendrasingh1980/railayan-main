@@ -31,7 +31,7 @@ const getDistanceInMeters = (lat1, lon1, lat2, lon2) => {
 
 let dbInstance = null;
 
-const DB_VERSION = "c645ae4"; // c645ae4
+const DB_VERSION = "52bfcb7";
 
 const getDB = async () => {
   try {
@@ -1159,7 +1159,7 @@ const TrainSearchScreen = ({ onBack, onGoToRoute, onGoToLive, savedState, onSave
       ) : null}
       {trains.length > 0 ? (
         <FlatList data={trains} keyExtractor={(item) => item.number} contentContainerStyle={{ padding: 12 }}
-          ListHeaderComponent={<Text style={{ color: "#888", fontSize: 13, marginBottom: 10 }}>{trains.length + " trains mili — " + fromStation.station_code + " → " + toStation.station_code}</Text>}
+          ListHeaderComponent={<Text style={{ color: "#888", fontSize: 13, marginBottom: 10 }}>{trains.length + " trains mili — " + (fromStation?.station_code || "") + " → " + (toStation?.station_code || "")}</Text>}
           renderItem={({ item }) => (
             <TouchableOpacity onPress={() => setSelectedTrain(item)} style={{ backgroundColor: "#2a2a2a", borderRadius: 12, padding: 14, marginBottom: 10 }}>
               <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
