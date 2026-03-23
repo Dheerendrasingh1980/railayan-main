@@ -7,6 +7,7 @@ import * as Speech from "expo-speech";
 import * as SQLite from "expo-sqlite";
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Animated, BackHandler, Dimensions, FlatList, Keyboard, ScrollView, Share, Text, TextInput, TouchableOpacity, View } from "react-native";
+import { WebView } from "react-native-webview";
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
 const SCREEN_HEIGHT = Dimensions.get("window").height;
@@ -98,41 +99,79 @@ const getDistanceInMeters = (lat1, lon1, lat2, lon2) => {
 };
 
 let dbInstance = null;
+let currentDBVersion = null;
 
-const DB_VERSION = "cf3c67b";
+// GitHub se latest version fetch karo
+const fetchLatestDBVersion = async () => {
+  try {
+    const response = await fetch(
+      "https://raw.githubusercontent.com/railayanapp/railayan-data/main/version.json",
+      { cache: "no-store" }
+    );
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.version || null;
+  } catch (e) {
+    console.log("Version fetch failed:", e);
+    return null;
+  }
+};
 
 const getDB = async () => {
+  if (dbInstance) return dbInstance;
   try {
     const dbName = "railayan.db";
     const dbPath = FileSystem.documentDirectory + "SQLite/" + dbName;
-    
     const dir = FileSystem.documentDirectory + "SQLite/";
+
+    // SQLite folder banao agar nahi hai
     const dirInfo = await FileSystem.getInfoAsync(dir);
     if (!dirInfo.exists) {
       await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
     }
 
+    // Local mein saved version check karo
     const savedVersion = await AsyncStorage.getItem("db_version");
     const fileInfo = await FileSystem.getInfoAsync(dbPath);
     const fileExists = fileInfo.exists && fileInfo.size && fileInfo.size > 1000000;
 
-    if (savedVersion !== DB_VERSION || !fileExists) {
-      console.log("Downloading DB...");
-      await FileSystem.downloadAsync(
-        "https://github.com/railayanapp/railayan-data/raw/" + DB_VERSION + "/railayan.db",
-        dbPath
-      );
-      await AsyncStorage.setItem("db_version", DB_VERSION);
-      console.log("Download complete!");
-    } else {
-      console.log("Using cached DB");
+    // GitHub se latest version fetch karo
+    const latestVersion = await fetchLatestDBVersion();
+    console.log("Saved:", savedVersion, "| Latest:", latestVersion, "| FileExists:", fileExists);
+
+    // Version same hai aur file bhi hai → seedha open karo
+    if (latestVersion && savedVersion === latestVersion && fileExists) {
+      console.log("DB up to date:", latestVersion);
+      currentDBVersion = latestVersion;
+      dbInstance = await SQLite.openDatabaseAsync(dbName);
+      return dbInstance;
     }
 
-    if (!dbInstance) {
-      dbInstance = await SQLite.openDatabaseAsync(dbName);
-      console.log("DB opened successfully!");
+    // Version different hai ya file nahi → download karo
+    const versionToDownload = latestVersion || savedVersion || "cf3c67b"; // fallback
+    console.log("Downloading DB version:", versionToDownload);
+
+    await FileSystem.downloadAsync(
+      "https://github.com/railayanapp/railayan-data/raw/" + versionToDownload + "/railayan.db",
+      dbPath
+    );
+
+    // Size check
+    const fileInfoAfter = await FileSystem.getInfoAsync(dbPath);
+    if (!fileInfoAfter.exists || fileInfoAfter.size < 1000000) {
+      console.log("Download failed or file too small");
+      dbInstance = null;
+      return null;
     }
+
+    // Save karo new version
+    await AsyncStorage.setItem("db_version", versionToDownload);
+    currentDBVersion = versionToDownload;
+    console.log("DB downloaded successfully:", versionToDownload);
+
+    dbInstance = await SQLite.openDatabaseAsync(dbName);
     return dbInstance;
+
   } catch (e) {
     console.log("DB Error:", e);
     dbInstance = null;
@@ -912,8 +951,19 @@ const RouteScreen = ({ onBack, initialTrainNumber }) => {
   const [loading, setLoading] = useState(false);
   const [dbReady, setDbReady] = useState(false);
   const [error, setError] = useState("");
+  const [recentSearches, setRecentSearches] = useState([]);
+  const [showRoute, setShowRoute] = useState(false);
 
   useEffect(() => { getDB().then((db) => { if (db) setDbReady(true); else setError("Database load nahi hua!"); }); }, []);
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const saved = await AsyncStorage.getItem("route_recent_searches");
+        if (saved) setRecentSearches(JSON.parse(saved));
+      } catch (e) {}
+    };
+    load();
+  }, []);
   useEffect(() => { if (initialTrainNumber && dbReady) loadSchedule(initialTrainNumber); }, [dbReady]);
 
   const loadSchedule = async (num) => {
@@ -922,7 +972,16 @@ const RouteScreen = ({ onBack, initialTrainNumber }) => {
     setLoading(true); setError(""); setScheduleData(null);
     try {
       const result = await getTrainScheduleFromDB(trimmed);
-      if (result && result.stations.length > 0) setScheduleData(result);
+      if (result && result.stations.length > 0) {
+        setScheduleData(result);
+        setShowRoute(true);
+        const newSearch = { trainNumber: trimmed, trainName: result.train.name || trimmed, fromStn: result.train.from_stn || "", toStn: result.train.to_stn || "" };
+        setRecentSearches(prev => {
+          const updated = [newSearch, ...prev.filter(s => s.trainNumber !== trimmed)].slice(0, 10);
+          AsyncStorage.setItem("route_recent_searches", JSON.stringify(updated));
+          return updated;
+        });
+      }
       else setError("Train nahi mili! Train number check karo.");
     } catch (e) { setError("Error aaya! Try karo."); }
     setLoading(false);
@@ -933,7 +992,9 @@ const RouteScreen = ({ onBack, initialTrainNumber }) => {
   return (
     <View style={{ flex: 1, backgroundColor: "#1a1a1a" }}>
       <View style={{ backgroundColor: "#FF6200", padding: 20, paddingTop: 50, flexDirection: "row", alignItems: "center" }}>
-        <TouchableOpacity onPress={onBack}><Text style={{ color: "white", fontSize: 18, marginRight: 15 }}>{"←"}</Text></TouchableOpacity>
+        <TouchableOpacity onPress={() => { if (showRoute) { setShowRoute(false); setScheduleData(null); setSearchQuery(""); setError(""); } else { onBack(); } }}>
+          <Text style={{ color: "white", fontSize: 18, marginRight: 15 }}>{"←"}</Text>
+        </TouchableOpacity>
         <View style={{ flex: 1 }}>
           {scheduleData ? (
             <>
@@ -972,7 +1033,7 @@ const RouteScreen = ({ onBack, initialTrainNumber }) => {
           <Text style={{ color: "#888", fontSize: 13, marginTop: 8, textAlign: "center" }}>{"Example: 12476, 12301, 22439"}</Text>
         </View>
       ) : null}
-      {(scheduleData && !loading) ? (
+      {(scheduleData && !loading && showRoute) ? (
         <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingVertical: 16 }}>
           <View style={{ marginHorizontal: 16, backgroundColor: "#2a2a2a", borderRadius: 12, padding: 14, marginBottom: 16 }}>
             <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
@@ -1034,19 +1095,30 @@ const RouteScreen = ({ onBack, initialTrainNumber }) => {
         </ScrollView>
       ) : null}
       {(!scheduleData && !loading && !error) ? (
-        <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: 30 }}>
-          <Text style={{ fontSize: 60, marginBottom: 16 }}>{"🗺️"}</Text>
-          <Text style={{ color: "white", fontSize: 18, fontWeight: "bold", textAlign: "center" }}>{"Train ka route dekhein!"}</Text>
-          <Text style={{ color: "#888", fontSize: 14, marginTop: 8, textAlign: "center" }}>{"Upar train number daalein\naur saare stations dekhein!"}</Text>
-          <View style={{ backgroundColor: "#2a2a2a", borderRadius: 12, padding: 16, marginTop: 20, width: "100%" }}>
-            <Text style={{ color: "#FF6200", fontSize: 13, fontWeight: "bold", marginBottom: 8 }}>{"Examples:"}</Text>
-            {["12476 — Hapa SF Express", "12301 — Howrah Rajdhani", "12951 — Mumbai Rajdhani"].map((ex, i) => (
-              <TouchableOpacity key={i} onPress={() => { const num = ex.split(" ")[0]; setSearchQuery(num); loadSchedule(num); }} style={{ paddingVertical: 8, borderBottomWidth: i < 2 ? 1 : 0, borderBottomColor: "#333" }}>
-                <Text style={{ color: "#aaa", fontSize: 13 }}>{"🚂 " + ex}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </View>
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16 }}>
+          {recentSearches.length > 0 ? (
+            <View>
+              <Text style={{ color: "#888", fontSize: 13, marginBottom: 10 }}>{"🕐 Recent Searches"}</Text>
+              {recentSearches.map((item, i) => (
+                <TouchableOpacity key={i} onPress={() => { setSearchQuery(item.trainNumber); loadSchedule(item.trainNumber); }}
+                  style={{ backgroundColor: "#2a2a2a", borderRadius: 12, padding: 14, marginBottom: 8, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                  <View>
+                    <Text style={{ color: "#FF6200", fontSize: 13, fontWeight: "bold" }}>{item.trainNumber}</Text>
+                    <Text style={{ color: "white", fontSize: 14, fontWeight: "bold", marginTop: 2 }}>{item.trainName}</Text>
+                    <Text style={{ color: "#888", fontSize: 11, marginTop: 2 }}>{item.fromStn + " → " + item.toStn}</Text>
+                  </View>
+                  <Text style={{ color: "#FF6200", fontSize: 20 }}>{"🚂"}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          ) : (
+            <View style={{ alignItems: "center", marginTop: 60 }}>
+              <Text style={{ fontSize: 60, marginBottom: 16 }}>{"🗺️"}</Text>
+              <Text style={{ color: "white", fontSize: 18, fontWeight: "bold", textAlign: "center" }}>{"Train number daalein!"}</Text>
+              <Text style={{ color: "#888", fontSize: 14, marginTop: 8, textAlign: "center" }}>{"Saare stations aur timings dekhein"}</Text>
+            </View>
+          )}
+        </ScrollView>
       ) : null}
     </View>
   );
@@ -1070,11 +1142,22 @@ const TrainSearchScreen = ({ onBack, onGoToRoute, onGoToLive, savedState, onSave
   const [savedFromStation, setSavedFromStation] = useState(null);
   const [savedToStation, setSavedToStation] = useState(null);
   const [searched, setSearched] = useState(savedState?.tsTrains?.length > 0);
+  const [showResults, setShowResults] = useState(false);
+  const [recentSearches, setRecentSearches] = useState([]);
   const [selectedTrain, setSelectedTrain] = useState(null);
   const [dbReady, setDbReady] = useState(false);
   const [showDatePicker, setShowDatePicker] = useState(false);
 
   useEffect(() => { getDB().then((db) => { if (db) setDbReady(true); }); }, []);
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const saved = await AsyncStorage.getItem("ts_recent_searches");
+        if (saved) setRecentSearches(JSON.parse(saved));
+      } catch (e) {}
+    };
+    load();
+  }, []);
 
   const searchStations = async (text, type) => {
     if (type === "from") { setFromQuery(text); setFromStation(null); } else { setToQuery(text); setToStation(null); }
@@ -1126,7 +1209,15 @@ const results = await db.getAllAsync(
 );
       setTrains(results || []);
       onSaveState({ fromStation, toStation, fromQuery, toQuery, tsDate: journeyDate.toISOString(), trains: results || [] });
+      // Recent save karo
+      const newSearch = { fromCode: fromStation.station_code, fromName: fromStation.station_name, toCode: toStation.station_code, toName: toStation.station_name };
+      setRecentSearches(prev => {
+        const updated = [newSearch, ...prev.filter(s => !(s.fromCode === newSearch.fromCode && s.toCode === newSearch.toCode))].slice(0, 5);
+        AsyncStorage.setItem("ts_recent_searches", JSON.stringify(updated));
+        return updated;
+      });
       setSearched(true);
+      setShowResults(true);
     } catch (e) { console.log("Find trains error:", e); setSearched(true); }
     setSearching(false);
   };
@@ -1143,6 +1234,61 @@ const results = await db.getAllAsync(
     } catch (e) { return "---"; }
   };
 
+  if (showResults) {
+    return (
+      <View style={{ flex: 1, backgroundColor: "#1a1a1a" }}>
+        <View style={{ backgroundColor: "#FF6200", padding: 20, paddingTop: 50, flexDirection: "row", alignItems: "center" }}>
+          <TouchableOpacity onPress={() => setShowResults(false)}>
+            <Text style={{ color: "white", fontSize: 18, marginRight: 15 }}>{"←"}</Text>
+          </TouchableOpacity>
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: 16, fontWeight: "bold", color: "white" }}>{fromStation?.station_code + " → " + toStation?.station_code}</Text>
+            <Text style={{ fontSize: 11, color: "white", opacity: 0.85 }}>{trains.length + " trains mili"}</Text>
+          </View>
+        </View>
+        {trains.length === 0 ? (
+          <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
+            <Text style={{ fontSize: 50, marginBottom: 16 }}>{"😕"}</Text>
+            <Text style={{ color: "white", fontSize: 16, fontWeight: "bold" }}>{"Koi train nahi mili!"}</Text>
+          </View>
+        ) : (
+          <FlatList data={trains} keyExtractor={(item, index) => item.number + "_" + index}
+            contentContainerStyle={{ padding: 12 }}
+            renderItem={({ item }) => (
+              <TouchableOpacity onPress={() => { setSelectedTrain(item); setShowResults(false); }}
+                style={{ backgroundColor: "#2a2a2a", borderRadius: 12, padding: 14, marginBottom: 10 }}>
+                <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: "#FF6200", fontSize: 13, fontWeight: "bold" }}>{item.number}</Text>
+                    <Text style={{ color: "white", fontSize: 14, fontWeight: "bold", marginTop: 2 }} numberOfLines={1}>{item.name}</Text>
+                  </View>
+                  {item.type ? (
+                    <View style={{ backgroundColor: "#333", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8 }}>
+                      <Text style={{ color: "#aaa", fontSize: 12 }}>{item.type}</Text>
+                    </View>
+                  ) : null}
+                </View>
+                <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+                  <View style={{ alignItems: "center" }}>
+                    <Text style={{ color: "white", fontSize: 18, fontWeight: "bold" }}>{item.from_dep ? item.from_dep.substring(0,5) : "---"}</Text>
+                    <Text style={{ color: "#888", fontSize: 11, marginTop: 2 }}>{fromStation?.station_code}</Text>
+                  </View>
+                  <View style={{ flex: 1, alignItems: "center" }}>
+                    <Text style={{ color: "#FF6200", fontSize: 12 }}>{"🚂"}</Text>
+                    <View style={{ height: 1, width: "80%", backgroundColor: "#444", marginTop: 4 }} />
+                  </View>
+                  <View style={{ alignItems: "center" }}>
+                    <Text style={{ color: "white", fontSize: 18, fontWeight: "bold" }}>{item.to_arr ? item.to_arr.substring(0,5) : "---"}</Text>
+                    <Text style={{ color: "#888", fontSize: 11, marginTop: 2 }}>{toStation?.station_code}</Text>
+                  </View>
+                </View>
+              </TouchableOpacity>
+            )}
+          />
+        )}
+      </View>
+    );
+  }
   if (selectedTrain) {
     return (
       <View style={{ flex: 1, backgroundColor: "#1a1a1a" }}>
@@ -1187,7 +1333,9 @@ const results = await db.getAllAsync(
   return (
     <View style={{ flex: 1, backgroundColor: "#1a1a1a" }}>
       <View style={{ backgroundColor: "#FF6200", padding: 20, paddingTop: 50, flexDirection: "row", alignItems: "center" }}>
-        <TouchableOpacity onPress={onBack}><Text style={{ color: "white", fontSize: 18, marginRight: 15 }}>{"←"}</Text></TouchableOpacity>
+        <TouchableOpacity onPress={() => { if (showRoute) { setShowRoute(false); setScheduleData(null); setSearchQuery(""); setError(""); } else { onBack(); } }}>
+          <Text style={{ color: "white", fontSize: 18, marginRight: 15 }}>{"←"}</Text>
+        </TouchableOpacity>
         <Text style={{ fontSize: 20, fontWeight: "bold", color: "white" }}>{"🔎 Train Search"}</Text>
       </View>
       <View style={{ backgroundColor: "#111", padding: 16 }}>
@@ -1220,9 +1368,10 @@ const results = await db.getAllAsync(
             <ScrollView>{toSuggestions.map((s, i) => (<TouchableOpacity key={i} onPress={() => selectStation(s, "to")} style={{ padding: 12, borderBottomWidth: i < toSuggestions.length - 1 ? 1 : 0, borderBottomColor: "#333", flexDirection: "row", alignItems: "center" }}><View style={{ backgroundColor: "#FF6200", paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, marginRight: 10 }}><Text style={{ color: "white", fontSize: 12, fontWeight: "bold" }}>{s.station_code}</Text></View><Text style={{ color: "white", fontSize: 14 }}>{s.station_name}</Text></TouchableOpacity>))}</ScrollView>
           </View>
         ) : null}
-        <TouchableOpacity onPress={() => setShowDatePicker(true)} style={{ backgroundColor: "#2a2a2a", borderRadius: 12, padding: 14, marginBottom: 8, alignItems: "center" }}>
+        <TouchableOpacity disabled style={{ backgroundColor: "#2a2a2a", borderRadius: 12, padding: 14, marginBottom: 8, alignItems: "center", opacity: 0.5 }}>
   <Text style={{ color: "#888", fontSize: 11 }}>{"JOURNEY DATE"}</Text>
   <Text style={{ color: "white", fontSize: 15, marginTop: 4 }}>{journeyDate.toDateString()}</Text>
+  <Text style={{ color: "#FF6200", fontSize: 10, marginTop: 4 }}>{"⚠️ Coming Soon"}</Text>
 </TouchableOpacity>
 {showDatePicker ? (
   <DateTimePicker value={journeyDate} mode="date" display="calendar" onChange={(event, date) => { setShowDatePicker(false); if (date) setJourneyDate(date); }} />
@@ -1230,6 +1379,49 @@ const results = await db.getAllAsync(
         <TouchableOpacity onPress={findTrains} style={{ backgroundColor: fromStation && toStation ? "#FF6200" : "#555", borderRadius: 12, padding: 16, alignItems: "center", marginTop: 4 }}>
           {searching ? <ActivityIndicator color="white" /> : <Text style={{ color: "white", fontSize: 16, fontWeight: "bold" }}>{"🔍 FIND TRAINS"}</Text>}
         </TouchableOpacity>
+        {recentSearches.length > 0 ? (
+          <View style={{ marginTop: 20 }}>
+            <Text style={{ color: "#888", fontSize: 13, marginBottom: 10 }}>{"🕐 Recent Searches"}</Text>
+            {recentSearches.map((item, i) => (
+              <TouchableOpacity key={i} onPress={async () => {
+                const fs = { station_code: item.fromCode, station_name: item.fromName };
+                const ts = { station_code: item.toCode, station_name: item.toName };
+                setFromStation(fs); setFromQuery(item.fromName + " (" + item.fromCode + ")");
+                setToStation(ts); setToQuery(item.toName + " (" + item.toCode + ")");
+                setSearching(true); setTrains([]); setSearched(false); setSelectedTrain(null);
+                try {
+                  const db = await getDB(); if (!db) return;
+                  const fromCodes = getRelatedStations(item.fromCode);
+                  const toCodes = getRelatedStations(item.toCode);
+                  const fromPlaceholders = fromCodes.map(() => "?").join(",");
+                  const toPlaceholders = toCodes.map(() => "?").join(",");
+                  const results = await db.getAllAsync(
+                    `SELECT t.number, t.name, t.type, t.distance,
+                     s1.stop_number as from_stop, s1.departure as from_dep, s1.day as from_day, s1.station_code as from_code,
+                     s2.stop_number as to_stop, s2.arrival as to_arr, s2.day as to_day, s2.station_code as to_code
+                     FROM trains t
+                     JOIN stations s1 ON s1.train_number = t.number AND s1.station_code IN (${fromPlaceholders})
+                     JOIN stations s2 ON s2.train_number = t.number AND s2.station_code IN (${toPlaceholders})
+                     WHERE s1.stop_number < s2.stop_number
+                     GROUP BY t.number ORDER BY s1.departure ASC LIMIT 50`,
+                    [...fromCodes, ...toCodes]
+                  );
+                  setTrains(results || []);
+                  onSaveState({ fromStation: fs, toStation: ts, fromQuery: item.fromName + " (" + item.fromCode + ")", toQuery: item.toName + " (" + item.toCode + ")", trains: results || [] });
+                  setSearched(true);
+                  setShowResults(true);
+                } catch (e) { setSearched(true); }
+                setSearching(false);
+              }} style={{ backgroundColor: "#2a2a2a", borderRadius: 12, padding: 14, marginBottom: 8, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                <View>
+                  <Text style={{ color: "white", fontSize: 14, fontWeight: "bold" }}>{item.fromCode + " → " + item.toCode}</Text>
+                  <Text style={{ color: "#888", fontSize: 12, marginTop: 2 }}>{item.fromName + " → " + item.toName}</Text>
+                </View>
+                <Text style={{ color: "#FF6200", fontSize: 16 }}>{"→"}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        ) : null}
       </View>
       {(searched && !searching && trains.length === 0) ? (
         <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: 30 }}>
@@ -1237,7 +1429,7 @@ const results = await db.getAllAsync(
           <Text style={{ color: "white", fontSize: 16, fontWeight: "bold", textAlign: "center" }}>{"Koi train nahi mili!"}</Text>
         </View>
       ) : null}
-      {trains.length > 0 ? (
+      {trains.length > 0 && !showResults ? (
         <FlatList data={trains} keyExtractor={(item, index) => item.number + "_" + index} contentContainerStyle={{ padding: 12 }}
           ListHeaderComponent={<Text style={{ color: "#888", fontSize: 13, marginBottom: 10 }}>{trains.length + " trains mili — " + (fromStation?.station_code || "") + " → " + (toStation?.station_code || "")}</Text>}
           renderItem={({ item }) => (
@@ -1293,6 +1485,8 @@ const LiveTrainScreen = ({ onBack }) => {
 
   // SCREEN STATE
   const [currentView, setCurrentView] = useState("search");
+  const [recentSearches, setRecentSearches] = useState([]);
+const [recentRoutes, setRecentRoutes] = useState([]);
 
   // SELECTED TRAIN
   const [selectedTrain, setSelectedTrain] = useState(null);
@@ -1321,6 +1515,13 @@ const LiveTrainScreen = ({ onBack }) => {
   const [liveApiData, setLiveApiData] = useState(null);
   const [nightMode, setNightMode] = useState(false);
   const [batterySaver, setBatterySaver] = useState(false);
+  const [viewMode, setViewMode] = useState("timeline");
+  const [smoothTrainLat, setSmoothTrainLat] = useState(null);
+  const [smoothTrainLon, setSmoothTrainLon] = useState(null);
+  const animTrainLat = useRef(null);
+  const animTrainLon = useRef(null);
+  const [trainProgress, setTrainProgress] = useState({ fromIdx: 0, toIdx: 1, progress: 0 });
+  const mapRef = useRef(null);
 
   const scrollRef = useRef(null);
   const popupAnim = useRef(new Animated.Value(0)).current;
@@ -1328,6 +1529,30 @@ const LiveTrainScreen = ({ onBack }) => {
 
   // DB READY
   useEffect(() => { getDB(); }, []);
+  useEffect(() => {
+    const loadRecent = async () => {
+      try {
+        const s1 = await AsyncStorage.getItem("live_recent_searches");
+        if (s1) setRecentSearches(JSON.parse(s1));
+        const s2 = await AsyncStorage.getItem("live_route_searches");
+        if (s2) setRecentRoutes(JSON.parse(s2));
+      } catch (e) {}
+    };
+    loadRecent();
+  }, []);
+  // Recent searches load karo
+  useEffect(() => {
+    const loadRecent = async () => {
+      try {
+        const saved = await AsyncStorage.getItem("live_recent_searches");
+        if (saved) {
+          const list = JSON.parse(saved);
+          setRecentSearches(list);
+          }
+      } catch (e) {}
+    };
+    loadRecent();
+  }, []);
 
   // CLEANUP
   useEffect(() => {
@@ -1399,6 +1624,12 @@ const LiveTrainScreen = ({ onBack }) => {
       setSavedFromStation(fromStation);
       setSavedToStation(toStation);
       setCurrentView("trainlist");
+      const routeSearch = { fromCode: fromStation.station_code, fromName: fromStation.station_name, toCode: toStation.station_code, toName: toStation.station_name };
+      setRecentRoutes(prev => {
+        const updated = [routeSearch, ...prev.filter(s => !(s.fromCode === routeSearch.fromCode && s.toCode === routeSearch.toCode))].slice(0, 5);
+        AsyncStorage.setItem("live_route_searches", JSON.stringify(updated));
+        return updated;
+      });
     } catch (e) { }
     setSearching(false);
   };
@@ -1413,6 +1644,12 @@ const LiveTrainScreen = ({ onBack }) => {
       setAllStations(stations || []);
       setCurrentView("live");
       fetchLiveApiData(trainNum);
+      const newSearch = { trainNumber: trainNum, trainName: train?.name || trainNum, fromStn: train?.from_stn || "", toStn: train?.to_stn || "" };
+      setRecentSearches(prev => {
+        const updated = [newSearch, ...prev.filter(s => s.trainNumber !== trainNum)].slice(0, 5);
+        AsyncStorage.setItem("live_recent_searches", JSON.stringify(updated));
+        return updated;
+      });
     } catch (e) { alert("Error: " + e.message); }
   };
 
@@ -1459,12 +1696,16 @@ const LiveTrainScreen = ({ onBack }) => {
   const stopGPS = () => {
     if (locationSub.current) { locationSub.current.remove(); locationSub.current = null; }
     setGpsActive(false);
+    setGpsGranted(false);
+    animTrainLat.current = null;
+    animTrainLon.current = null;
   };
 
   // ---- TRAIN POSITION UPDATE ----
   const updateTrainPosition = (lat, lon) => {
     if (!allStations || allStations.length === 0) return;
-    const stopsWithCoords = allStations.filter(s => s.latitude && s.longitude && s.latitude !== 0 && s.longitude !== 0);
+    const stopsWithCoords = allStations.filter(s => s.latitude && s.longitude && parseFloat(s.latitude) !== 0 && parseFloat(s.longitude) !== 0);
+    const haltStopsWithCoords = stopsWithCoords.filter(s => s.is_halt === 1);
     if (stopsWithCoords.length < 2) return;
     let minDist = 999999;
     let nearestIdx = 0;
@@ -1474,28 +1715,72 @@ const LiveTrainScreen = ({ onBack }) => {
     });
     const nearest = stopsWithCoords[nearestIdx];
     setNearestStop(nearest);
+
+    // Next station find karo
+    const nextIdx = nearestIdx + 1 < stopsWithCoords.length ? nearestIdx + 1 : nearestIdx;
+    const nextStn = stopsWithCoords[nextIdx];
+
+    // Progress calculate karo — 0 to 1 (current station se next station ke beech)
+    let progress = 0;
+    if (nextStn && nextStn.station_code !== nearest.station_code) {
+      const totalDist = getDistanceInMeters(nearest.latitude, nearest.longitude, nextStn.latitude, nextStn.longitude);
+      const distFromNearest = getDistanceInMeters(lat, lon, nearest.latitude, nearest.longitude);
+      progress = totalDist > 0 ? Math.min(1, distFromNearest / totalDist) : 0;
+    }
+    // halt stations mein index dhundho
+    // Nearest halt station dhundho — agar nearest non-stop hai to pichla halt lo
+    let nearestHaltIdx = haltStopsWithCoords.findIndex(s => s.station_code === nearest.station_code);
+    if (nearestHaltIdx === -1) {
+      // Non-stop station hai — pichla halt station dhundho
+      const nearestStopNum = nearest.stop_number;
+      for (let i = haltStopsWithCoords.length - 1; i >= 0; i--) {
+        if (haltStopsWithCoords[i].stop_number < nearestStopNum) {
+          nearestHaltIdx = i;
+          break;
+        }
+      }
+    }
+    if (nearestHaltIdx === -1) nearestHaltIdx = 0;
+    const nextHalt = haltStopsWithCoords[nearestHaltIdx + 1];
+    let haltProgress = 0;
+    if (nextHalt) {
+      const totalDist = getDistanceInMeters(nearest.latitude, nearest.longitude, nextHalt.latitude, nextHalt.longitude);
+      const distFromNearest = getDistanceInMeters(lat, lon, nearest.latitude, nearest.longitude);
+      haltProgress = totalDist > 0 ? Math.min(1, distFromNearest / totalDist) : 0;
+    }
+    setTrainProgress({ fromIdx: nearestHaltIdx, toIdx: nearestHaltIdx + 1, progress: haltProgress });
+
     if (minDist < 500 && nearest.is_halt === 1) {
       if (!crossedStations.includes(nearest.station_code)) {
         setCrossedStations(prev => [...prev, nearest.station_code]);
         setCrossedStationName(nearest.station_name);
-        const nextIdx = nearestIdx + 1;
-        if (nextIdx < stopsWithCoords.length) {
-          setNextStationName(stopsWithCoords[nextIdx].station_name);
-        }
+        setNextStationName(nextStn?.station_name || "");
         showCrossedPopup();
       }
     }
+    if (nextStn) {
+      setNextStationName(nextStn.station_name);
+    }
     if (nearestIdx < stopsWithCoords.length - 1) {
-      setCurrentSegment({
-        prevStop: stopsWithCoords[nearestIdx],
-        nextStop: stopsWithCoords[nearestIdx + 1],
-        progress: Math.min(1, minDist / 5000)
-      });
+      setCurrentSegment({ prevStop: nearest, nextStop: nextStn, progress });
     }
     const key = nearest.station_code;
     setExpandedSections(prev => ({ ...prev, [key]: true }));
-  };
 
+    // Smooth map position
+    if (animTrainLat.current === null) {
+      animTrainLat.current = lat;
+      animTrainLon.current = lon;
+      setSmoothTrainLat(lat);
+      setSmoothTrainLon(lon);
+    } else {
+      animTrainLat.current = animTrainLat.current + 0.3 * (lat - animTrainLat.current);
+      animTrainLon.current = animTrainLon.current + 0.3 * (lon - animTrainLon.current);
+      setSmoothTrainLat(animTrainLat.current);
+      setSmoothTrainLon(animTrainLon.current);
+    }
+  };
+    
   // ---- POPUP ----
   const showCrossedPopup = () => {
     setShowCrossPopup(true);
@@ -1537,10 +1822,10 @@ const LiveTrainScreen = ({ onBack }) => {
 
         <View style={{ flexDirection: "row", margin: 16, backgroundColor: cardBg, borderRadius: 12, padding: 4 }}>
           <TouchableOpacity onPress={() => setSearchMode("route")} style={{ flex: 1, padding: 10, borderRadius: 10, backgroundColor: searchMode === "route" ? "#FF6200" : "transparent", alignItems: "center" }}>
-            <Text style={{ color: "white", fontWeight: "bold" }}>{"🗺️ Route Se"}</Text>
+            <Text style={{ color: "white", fontWeight: "bold" }}>{"🗺️ Route"}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setSearchMode("number")} style={{ flex: 1, padding: 10, borderRadius: 10, backgroundColor: searchMode === "number" ? "#FF6200" : "transparent", alignItems: "center" }}>
-            <Text style={{ color: "white", fontWeight: "bold" }}>{"🔢 Train No. Se"}</Text>
+            <Text style={{ color: "white", fontWeight: "bold" }}>{"🔢 Train No."}</Text>
           </TouchableOpacity>
         </View>
 
@@ -1583,15 +1868,60 @@ const LiveTrainScreen = ({ onBack }) => {
                 </View>
               ) : null}
 
-              <TouchableOpacity onPress={() => setShowDatePicker(true)} style={{ backgroundColor: cardBg, borderRadius: 12, padding: 14, marginBottom: 12, alignItems: "center" }}>
+              <TouchableOpacity disabled style={{ backgroundColor: cardBg, borderRadius: 12, padding: 14, marginBottom: 12, alignItems: "center", opacity: 0.5 }}>
                 <Text style={{ color: "#888", fontSize: 11 }}>{"JOURNEY DATE"}</Text>
                 <Text style={{ color: textColor, fontSize: 15, marginTop: 4 }}>{journeyDate.toDateString()}</Text>
+                <Text style={{ color: "#FF6200", fontSize: 10, marginTop: 4 }}>{"⚠️ Coming Soon"}</Text>
               </TouchableOpacity>
               {showDatePicker ? <DateTimePicker value={journeyDate} mode="date" display="calendar" onChange={(e, d) => { setShowDatePicker(false); if (d) setJourneyDate(d); }} /> : null}
 
               <TouchableOpacity onPress={findTrains} style={{ backgroundColor: "#FF6200", borderRadius: 12, padding: 16, alignItems: "center" }}>
                 {searching ? <ActivityIndicator color="white" /> : <Text style={{ color: "white", fontSize: 16, fontWeight: "bold" }}>{"🔍 Search Trains"}</Text>}
               </TouchableOpacity>
+              {recentRoutes.length > 0 ? (
+                <View style={{ marginTop: 20 }}>
+                  <Text style={{ color: "#888", fontSize: 13, marginBottom: 10 }}>{"🕐 Recent Routes"}</Text>
+                  {recentRoutes.map((item, i) => (
+                    <TouchableOpacity key={i} onPress={async () => {
+                      const fs = { station_code: item.fromCode, station_name: item.fromName };
+                      const ts = { station_code: item.toCode, station_name: item.toName };
+                      setFromQuery(item.fromName + " (" + item.fromCode + ")");
+                      setFromStation(fs);
+                      setToQuery(item.toName + " (" + item.toCode + ")");
+                      setToStation(ts);
+                      setSearching(true); setTrainList([]);
+                      try {
+                        const db = await getDB(); if (!db) return;
+                        const fromCodes = getRelatedStations(item.fromCode);
+                        const toCodes = getRelatedStations(item.toCode);
+                        const fromPlaceholders = fromCodes.map(() => "?").join(",");
+                        const toPlaceholders = toCodes.map(() => "?").join(",");
+                        const results = await db.getAllAsync(
+                          `SELECT t.number, t.name, t.type, s1.departure as from_dep, s1.day as from_day, s2.arrival as to_arr, s2.day as to_day, s1.stop_number as from_stop, s2.stop_number as to_stop
+                           FROM trains t
+                           JOIN stations s1 ON s1.train_number = t.number AND s1.station_code IN (${fromPlaceholders})
+                           JOIN stations s2 ON s2.train_number = t.number AND s2.station_code IN (${toPlaceholders})
+                           WHERE s1.stop_number < s2.stop_number
+                           GROUP BY t.number ORDER BY s1.departure ASC LIMIT 50`,
+                          [...fromCodes, ...toCodes]
+                        );
+                        setTrainList(results || []);
+                        setSavedTrainList(results || []);
+                        setSavedFromStation(fs);
+                        setSavedToStation(ts);
+                        setCurrentView("trainlist");
+                      } catch (e) {}
+                      setSearching(false);
+                    }} style={{ backgroundColor: cardBg, borderRadius: 12, padding: 14, marginBottom: 8, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                      <View>
+                        <Text style={{ color: "white", fontSize: 14, fontWeight: "bold" }}>{item.fromCode + " → " + item.toCode}</Text>
+                        <Text style={{ color: "#888", fontSize: 12, marginTop: 2 }}>{item.fromName + " → " + item.toName}</Text>
+                      </View>
+                      <Text style={{ color: "#FF6200", fontSize: 16 }}>{"→"}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              ) : null}
             </>
           ) : (
             <>
@@ -1602,6 +1932,22 @@ const LiveTrainScreen = ({ onBack }) => {
               <TouchableOpacity onPress={() => { if (trainNumber.length >= 4) loadTrainStations(trainNumber); else alert("Sahi train number daalo!"); }} style={{ backgroundColor: "#FF6200", borderRadius: 12, padding: 16, alignItems: "center" }}>
                 <Text style={{ color: "white", fontSize: 16, fontWeight: "bold" }}>{"🚂 TRAIN DHUNDO"}</Text>
               </TouchableOpacity>
+              {recentSearches.length > 0 ? (
+                <View style={{ marginTop: 20 }}>
+                  <Text style={{ color: "#888", fontSize: 13, marginBottom: 10 }}>{"🕐 Recent Searches"}</Text>
+                  {recentSearches.map((item, i) => (
+                    <TouchableOpacity key={i} onPress={() => loadTrainStations(item.trainNumber)}
+                      style={{ backgroundColor: cardBg, borderRadius: 12, padding: 14, marginBottom: 8, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                      <View>
+                        <Text style={{ color: "#FF6200", fontSize: 13, fontWeight: "bold" }}>{item.trainNumber}</Text>
+                        <Text style={{ color: textColor, fontSize: 14, fontWeight: "bold", marginTop: 2 }}>{item.trainName}</Text>
+                        <Text style={{ color: "#888", fontSize: 11, marginTop: 2 }}>{item.fromStn + " → " + item.toStn}</Text>
+                      </View>
+                      <Text style={{ color: "#FF6200", fontSize: 20 }}>{"🚂"}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              ) : null}
             </>
           )}
         </ScrollView>
@@ -1650,13 +1996,23 @@ const LiveTrainScreen = ({ onBack }) => {
             <Text style={{ color: "white", fontSize: 9 }}>{"km/h"}</Text>
           </View>
         </View>
-        <View style={{ flexDirection: "row", marginTop: 8, justifyContent: "flex-end" }}>
-          <TouchableOpacity onPress={() => setNightMode(!nightMode)} style={{ backgroundColor: "rgba(0,0,0,0.3)", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20, marginRight: 6 }}>
-            <Text style={{ color: "white", fontSize: 11 }}>{nightMode ? "☀️ Day" : "🌙 Night"}</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => { setBatterySaver(!batterySaver); if (gpsActive) { stopGPS(); setTimeout(startGPS, 500); } }} style={{ backgroundColor: "rgba(0,0,0,0.3)", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20 }}>
-            <Text style={{ color: "white", fontSize: 11 }}>{batterySaver ? "🔋 Saver ON" : "🔋 Saver OFF"}</Text>
-          </TouchableOpacity>
+        <View style={{ flexDirection: "row", marginTop: 8, justifyContent: "space-between", alignItems: "center" }}>
+          <View style={{ flexDirection: "row", backgroundColor: "rgba(0,0,0,0.3)", borderRadius: 20, padding: 2 }}>
+            <TouchableOpacity onPress={() => setViewMode("timeline")} style={{ backgroundColor: viewMode === "timeline" ? "white" : "transparent", paddingHorizontal: 12, paddingVertical: 4, borderRadius: 18 }}>
+              <Text style={{ color: viewMode === "timeline" ? "#FF6200" : "white", fontSize: 11, fontWeight: "bold" }}>{"📋 Timeline"}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => setViewMode("map")} style={{ backgroundColor: viewMode === "map" ? "white" : "transparent", paddingHorizontal: 12, paddingVertical: 4, borderRadius: 18 }}>
+              <Text style={{ color: viewMode === "map" ? "#FF6200" : "white", fontSize: 11, fontWeight: "bold" }}>{"🗺️ Map"}</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={{ flexDirection: "row" }}>
+            <TouchableOpacity onPress={() => setNightMode(!nightMode)} style={{ backgroundColor: "rgba(0,0,0,0.3)", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20, marginRight: 6 }}>
+              <Text style={{ color: "white", fontSize: 11 }}>{nightMode ? "☀️ Day" : "🌙 Night"}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => { setBatterySaver(!batterySaver); if (gpsActive) { stopGPS(); setTimeout(startGPS, 500); } }} style={{ backgroundColor: "rgba(0,0,0,0.3)", paddingHorizontal: 10, paddingVertical: 4, borderRadius: 20 }}>
+              <Text style={{ color: "white", fontSize: 11 }}>{batterySaver ? "🔋 Saver ON" : "🔋 Saver OFF"}</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </View>
 
@@ -1701,6 +2057,84 @@ const LiveTrainScreen = ({ onBack }) => {
         </View>
       ) : null}
 
+      {viewMode === "map" ? (
+        <View style={{ flex: 1 }}>
+          <WebView
+            style={{ flex: 1 }}
+            originWhitelist={["*"]}
+            source={{ html: `<!DOCTYPE html><html><head>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+              <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+              <style>body,html,#map{margin:0;padding:0;height:100%;width:100%;}</style>
+            </head><body><div id="map"></div><script>
+              var stations = ${JSON.stringify(
+                allStations
+                  .filter(s => s.latitude && s.longitude && parseFloat(s.latitude) !== 0)
+                  .map(s => ({
+                    lat: parseFloat(s.latitude),
+                    lon: parseFloat(s.longitude),
+                    name: s.station_name,
+                    code: s.station_code,
+                    is_halt: s.is_halt,
+                    crossed: crossedStations.includes(s.station_code),
+                    nearest: nearestStop?.station_code === s.station_code
+                  }))
+              )};
+              var trainLat = ${smoothTrainLat || 0};
+              var trainLon = ${smoothTrainLon || 0};
+              var centerLat = trainLat || (stations[0] ? stations[0].lat : 23.0);
+              var centerLon = trainLon || (stations[0] ? stations[0].lon : 72.0);
+              var map = L.map('map').setView([centerLat, centerLon], 8);
+              L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap'
+              }).addTo(map);
+              var trackCoords = stations.map(s => [s.lat, s.lon]);
+              if(trackCoords.length > 1) {
+                L.polyline(trackCoords, {color: '#4a90d9', weight: 3}).addTo(map);
+              }
+              var crossedCoords = stations.filter(s => s.crossed).map(s => [s.lat, s.lon]);
+              if(crossedCoords.length > 1) {
+                L.polyline(crossedCoords, {color: '#4CAF50', weight: 4}).addTo(map);
+              }
+              stations.filter(s => s.is_halt === 1).forEach(function(s) {
+                var color = s.crossed ? '#4CAF50' : s.nearest ? '#FF6200' : '#4a90d9';
+                var size = s.nearest ? 14 : 10;
+                L.marker([s.lat, s.lon], {
+                  icon: L.divIcon({
+                    className: '',
+                    html: '<div style="background:rgba(0,0,0,0.8);border:2px solid ' + color + ';border-radius:6px;padding:3px 6px;white-space:nowrap;"><span style="color:' + color + ';font-size:' + size + 'px;font-weight:bold;">' + s.name + '</span><br><span style="color:' + color + ';font-size:9px;">' + s.code + '</span></div>',
+                    iconAnchor: [0, 0]
+                  })
+                }).addTo(map);
+              });
+              if(trainLat && trainLon) {
+                L.marker([trainLat, trainLon], {
+                  icon: L.divIcon({
+                    className: '',
+                    html: '<div style="background:#FF6200;border-radius:50%;padding:6px;border:3px solid white;font-size:20px;">🚂</div>',
+                    iconAnchor: [20, 20]
+                  })
+                }).addTo(map);
+              }
+            </script></body></html>` }}
+          />
+          <View style={{ position: "absolute", bottom: 80, left: 16, right: 16, backgroundColor: "rgba(0,0,0,0.8)", borderRadius: 12, padding: 12, flexDirection: "row", justifyContent: "space-between" }}>
+            <View style={{ alignItems: "center" }}>
+              <Text style={{ color: "#888", fontSize: 10 }}>{"ABHI PAAS MEIN"}</Text>
+              <Text style={{ color: "white", fontSize: 13, fontWeight: "bold", marginTop: 2 }}>{String(nearestStop?.station_name || "---")}</Text>
+            </View>
+            <View style={{ alignItems: "center" }}>
+              <Text style={{ color: "#888", fontSize: 10 }}>{"SPEED"}</Text>
+              <Text style={{ color: "#FF6200", fontSize: 13, fontWeight: "bold", marginTop: 2 }}>{gpsSpeed + " km/h"}</Text>
+            </View>
+            <View style={{ alignItems: "center" }}>
+              <Text style={{ color: "#888", fontSize: 10 }}>{"NEXT STATION"}</Text>
+              <Text style={{ color: "white", fontSize: 13, fontWeight: "bold", marginTop: 2 }}>{String(nextStationName || "---")}</Text>
+            </View>
+          </View>
+        </View>
+      ) : (
       <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ paddingVertical: 12, paddingBottom: 80 }}>
         {(() => {
           const elements = [];
@@ -1712,7 +2146,7 @@ const LiveTrainScreen = ({ onBack }) => {
             const isNearest = nearestStop?.station_code === stn.station_code;
             const isCrossed = crossedStations.includes(stn.station_code);
             const apiStn = getApiStation(stn.station_code);
-            if (isStop) {
+            if (isStop || isNearest) {
               if (prevStopIdx >= 0) {
                 const nonStops = allStations.slice(prevStopIdx + 1, idx).filter(s => s.is_halt === 0);
                 if (nonStops.length > 0) {
@@ -1782,7 +2216,21 @@ const LiveTrainScreen = ({ onBack }) => {
                     ) : (
                       <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: isCrossed ? "#4CAF50" : "#4a90d9", borderWidth: 2, borderColor: bg }} />
                     )}
-                    {!isLast ? <View style={{ width: 2, flex: 1, backgroundColor: isCrossed ? "#4CAF50" : "#4a90d9", minHeight: 24 }} /> : null}
+                    {!isLast ? (
+                      <View style={{ position: "relative", width: 2, flex: 1, minHeight: 24, backgroundColor: isCrossed ? "#4CAF50" : "#4a90d9" }}>
+                        {(() => {
+                          if (!gpsActive) return null;
+                          const stopsOnly = allStations.filter(s => s.is_halt === 1);
+                          const thisStopIdx = stopsOnly.findIndex(s => s.station_code === stn.station_code);
+                          if (thisStopIdx !== trainProgress.fromIdx) return null;
+                          return (
+                            <View style={{ position: "absolute", left: -10, top: trainProgress.progress * 20, zIndex: 10 }}>
+                              <Text style={{ fontSize: 14 }}>{"🚂"}</Text>
+                            </View>
+                          );
+                        })()}
+                      </View>
+                    ) : null}
                   </View>
                   <View style={{ flex: 1, paddingLeft: 12, paddingTop: 6, paddingBottom: 10 }}>
                     <Text style={{ color: isFirst || isLast ? "white" : (isNearest ? "#FF6200" : textColor), fontSize: isFirst || isLast ? 16 : 14, fontWeight: isFirst || isLast || isNearest ? "bold" : "normal" }}>
@@ -1803,6 +2251,7 @@ const LiveTrainScreen = ({ onBack }) => {
         })()}
         <View style={{ height: 40 }} />
       </ScrollView>
+      )}
 
       {showCrossPopup ? (
         <Animated.View style={{ position: "absolute", top: 180, left: 20, right: 20, backgroundColor: "#FF6200", borderRadius: 16, padding: 16, opacity: popupAnim, transform: [{ scale: popupAnim }] }}>
@@ -1976,7 +2425,7 @@ export default function HomeScreen() {
       onSaveState={(s) => { setTsFromStation(s.fromStation); setTsToStation(s.toStation); setTsFromQuery(s.fromQuery); setTsToQuery(s.toQuery); setTsTrains(s.trains); }}
     />;
   }
-  if (screen === "route") return <RouteScreen onBack={() => { setRouteTrainNumber(""); goBack(); }} initialTrainNumber={routeTrainNumber} />;
+  if (screen === "route") return <RouteScreen onBack={() => { setRouteTrainNumber(""); goBack(); }} initialTrainNumber={""} />;
   if (screen === "livetrain") return <LiveTrainScreen onBack={goBack} />;
   if (screen === "pnrdetail" && selectedPNR) {
     const d = selectedPNR.data; const depDate = formatDate(d.dateOfJourney); const arrDate = formatDate(d.arrivalDate); const duration = getDuration(d.dateOfJourney, d.arrivalDate);
